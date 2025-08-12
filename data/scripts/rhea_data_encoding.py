@@ -4,8 +4,8 @@ import pandas as pd
 from sklearn.preprocessing import LabelEncoder
 
 
-IN_FILE  = "corrected_materials_dataset.csv"
-OUT_FILE = "materials_rhea_encoded.csv"
+IN_FILE  = "data/data.csv"
+OUT_FILE = "data/encoded_data.csv"
 
 NUM_COLS = [
     "Density",
@@ -86,7 +86,7 @@ def main():
 
     # Save final CSV
     df_best.to_csv(OUT_FILE, index=False)
-    print(f"✅ Saved: {OUT_FILE}  shape={df_best.shape}")
+    print(f"Saved: {OUT_FILE}  shape={df_best.shape}")
 
 if __name__ == "__main__":
     main()
