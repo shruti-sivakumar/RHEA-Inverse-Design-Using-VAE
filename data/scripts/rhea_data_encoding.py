@@ -3,9 +3,11 @@ import numpy as np
 import pandas as pd
 from sklearn.preprocessing import LabelEncoder
 
-
 IN_FILE  = "data/data.csv"
-OUT_FILE = "data/encoded_data.csv"
+OUT_FILE_MODEL = "data/encoded_data.csv"          # numeric/model-ready
+OUT_FILE_HUMAN = "data/encoded_data_human.csv"    # readable for reports
+
+ELEMENTS = ['Al', 'Co', 'Cr', 'Hf', 'Mo', 'Nb', 'Si', 'Ta', 'Ti', 'V', 'W', 'Zr']
 
 NUM_COLS = [
     "Density",
@@ -23,42 +25,54 @@ CAT_COLS = [
     "Tension_Compression",
 ]
 
+EL_RE = re.compile(r"([A-Z][a-z]?)(\d*\.?\d+)?")
 
 def clean_numerical_value(v):
-    """Convert messy numeric strings to float, else NaN."""
-    if pd.isna(v):
-        return np.nan
+    if pd.isna(v): return np.nan
     s = str(v).strip().strip("\"'")
-    if s in {"", "-"}:
-        return np.nan
-    if s.upper() == "RT":
-        return 25.0
+    if s in {"", "-"}: return np.nan
+    if s.upper() == "RT": return 25.0
     m = re.search(r"\(([\d.,]+)\)", s)
-    if m:
-        s = m.group(1)
+    if m: s = m.group(1)
     s = re.sub(r"\[.*?\]", "", s)
-    if "/" in s:
-        s = s.split("/", 1)[0]
+    if "/" in s: s = s.split("/", 1)[0]
     s = re.sub(r"[^\d.,+\-eE]", " ", s).strip()
     s = re.sub(r"\s+", "", s)
-    if "," in s and "." in s:
-        s = s.replace(",", "")
-    elif "," in s:
-        s = s.replace(",", ".")
+    if "," in s and "." in s: s = s.replace(",", "")
+    elif "," in s: s = s.replace(",", ".")
     try:
         return float(s)
     except Exception:
         return np.nan
 
+def parse_composition_to_percents(comp_str: str, elements=ELEMENTS, eps=1e-12):
+    counts = {el: 0.0 for el in elements}
+    if not isinstance(comp_str, str) or not comp_str.strip():
+        return counts
+    total = 0.0
+    for sym, num in EL_RE.findall(comp_str):
+        amt = float(num) if num not in (None, "",) else 1.0
+        if sym in counts:
+            counts[sym] += amt
+            total += amt
+    if total < eps:  # all zeros
+        return counts
+    # to percentages
+    for el in counts:
+        counts[el] = 100.0 * counts[el] / total
+    # renorm to exact 100
+    s = sum(counts.values())
+    if abs(s - 100.0) > 1e-8:
+        for el in counts:
+            counts[el] *= (100.0 / s)
+    return counts
+
 def pick_best_max_yield_then_specific(g: pd.DataFrame) -> pd.Series:
-    """Pick row with max Yield_Strength, tie-break by max Specific_Strength."""
     max_y = g["Yield_Strength"].max()
     top = g[g["Yield_Strength"] == max_y]
     if len(top) == 1:
         return top.iloc[0]
-    # tie-breaker: highest Specific_Strength
     return top.loc[top["Specific_Strength"].fillna(-np.inf).idxmax()]
-
 
 def main():
     df = pd.read_csv(IN_FILE)
@@ -69,24 +83,71 @@ def main():
             df[col] = np.nan
         df[col] = df[col].apply(clean_numerical_value)
 
-    # Deduplicate per Composition
+    # Deduplicate per Composition (keep best)
     df_best = (
         df.groupby("Composition", as_index=False, group_keys=False)
           .apply(pick_best_max_yield_then_specific)
           .reset_index(drop=True)
     )
 
-    # Label encode categorical columns
+    # Composition -> percentages (+ fractions for modeling)
+    comp_pct_rows = [parse_composition_to_percents(c) for c in df_best["Composition"].fillna("")]
+    comp_pct_df = pd.DataFrame(comp_pct_rows, columns=ELEMENTS)
+    # check sums ~ 100
+    assert np.allclose(comp_pct_df.sum(axis=1).values, 100.0, atol=1e-6)
+    # rename columns
+    comp_pct_df = comp_pct_df.add_suffix("_pct")
+    comp_frac_df = comp_pct_df / 100.0
+    comp_frac_df.columns = [c.replace("_pct", "_frac") for c in comp_frac_df.columns]
+
+    # Encode categoricals (keep both original for human CSV and encoded for model CSV)
+    encoders = {}
     for col in CAT_COLS:
         if col not in df_best.columns:
             df_best[col] = "Unknown"
         df_best[col] = df_best[col].fillna("Unknown").astype(str)
         le = LabelEncoder()
         df_best[f"{col}_encoded"] = le.fit_transform(df_best[col])
+        encoders[col] = le  # if you want to inverse_transform later
 
-    # Save final CSV
-    df_best.to_csv(OUT_FILE, index=False)
-    print(f"Saved: {OUT_FILE}  shape={df_best.shape}")
+    # Drop Ref
+    if "Ref" in df_best.columns:
+        df_best = df_best.drop(columns=["Ref"])
+
+    # ---- Build HUMAN CSV (readable): composition % FIRST, then original cats, then numerics (Density etc.), then encoded cols
+    df_human = df_best.copy()
+
+    for col in comp_pct_df.columns[::-1]:  # reverse so insert order is kept
+        df_human.insert(1, col, comp_pct_df[col].values)
+
+    # Desired column order:
+    human_cols = (
+        ["Composition"] +                           # original formula (first & only)
+        list(comp_pct_df.columns) +                 # Al_pct ... Zr_pct
+        CAT_COLS +                                  # original categorical labels
+        NUM_COLS +                                  # numeric properties (incl. Yield_Strength)
+        [f"{c}_encoded" for c in CAT_COLS]          # encoded cats (optional/debug)
+    )
+
+    # Keep only those that exist, in the desired order
+    human_cols = [c for c in human_cols if c in df_human.columns]
+    df_human = df_human[human_cols]
+
+    # ---- Build MODEL CSV (numeric-only): composition fractions FIRST, then numerics, then encoded cats; NO original strings
+    model_cols = (
+        list(comp_frac_df.columns) +                     # composition fractions (sum=1)
+        NUM_COLS +                                       # numeric properties (y is Yield_Strength)
+        [f"{c}_encoded" for c in CAT_COLS]               # encoded categoricals
+    )
+    df_model = pd.concat([comp_frac_df, df_best], axis=1)
+    model_cols = [c for c in model_cols if c in df_model.columns]
+    df_model = df_model[model_cols]
+
+    # Save
+    df_model.to_csv(OUT_FILE_MODEL, index=False)
+    df_human.to_csv(OUT_FILE_HUMAN, index=False)
+    print(f"Saved: {OUT_FILE_MODEL}  shape={df_model.shape}")
+    print(f"Saved: {OUT_FILE_HUMAN}  shape={df_human.shape}")
 
 if __name__ == "__main__":
     main()
