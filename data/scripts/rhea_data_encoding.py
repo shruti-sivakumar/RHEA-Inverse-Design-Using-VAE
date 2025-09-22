@@ -83,18 +83,20 @@ def main():
             df[col] = np.nan
         df[col] = df[col].apply(clean_numerical_value)
 
-    # Deduplicate per Composition (keep best)
+    # Deduplicate per (Composition, Testing_Temp) (keep highest Yield_Strength)
     df_best = (
-        df.groupby("Composition", as_index=False, group_keys=False)
-          .apply(pick_best_max_yield_then_specific)
-          .reset_index(drop=True)
+        df.groupby(["Composition", "Testing_Temp"], as_index=False, group_keys=False)
+        .apply(pick_best_max_yield_then_specific, include_groups=False)
+        .reset_index(drop=True)
     )
 
     # Composition -> percentages (+ fractions for modeling)
     comp_pct_rows = [parse_composition_to_percents(c) for c in df_best["Composition"].fillna("")]
     comp_pct_df = pd.DataFrame(comp_pct_rows, columns=ELEMENTS)
+
     # check sums ~ 100
     assert np.allclose(comp_pct_df.sum(axis=1).values, 100.0, atol=1e-6)
+
     # rename columns
     comp_pct_df = comp_pct_df.add_suffix("_pct")
     comp_frac_df = comp_pct_df / 100.0
@@ -108,36 +110,32 @@ def main():
         df_best[col] = df_best[col].fillna("Unknown").astype(str)
         le = LabelEncoder()
         df_best[f"{col}_encoded"] = le.fit_transform(df_best[col])
-        encoders[col] = le  # if you want to inverse_transform later
+        encoders[col] = le
 
-    # Drop Ref
+    # Drop Ref if present
     if "Ref" in df_best.columns:
         df_best = df_best.drop(columns=["Ref"])
 
-    # ---- Build HUMAN CSV (readable): composition % FIRST, then original cats, then numerics (Density etc.), then encoded cols
+    # ---- HUMAN CSV ----
     df_human = df_best.copy()
-
-    for col in comp_pct_df.columns[::-1]:  # reverse so insert order is kept
+    for col in comp_pct_df.columns[::-1]:
         df_human.insert(1, col, comp_pct_df[col].values)
 
-    # Desired column order:
     human_cols = (
-        ["Composition"] +                           # original formula (first & only)
-        list(comp_pct_df.columns) +                 # Al_pct ... Zr_pct
-        CAT_COLS +                                  # original categorical labels
-        NUM_COLS +                                  # numeric properties (incl. Yield_Strength)
-        [f"{c}_encoded" for c in CAT_COLS]          # encoded cats (optional/debug)
+        ["Composition"] +
+        list(comp_pct_df.columns) +
+        CAT_COLS +
+        NUM_COLS +
+        [f"{c}_encoded" for c in CAT_COLS]
     )
-
-    # Keep only those that exist, in the desired order
     human_cols = [c for c in human_cols if c in df_human.columns]
     df_human = df_human[human_cols]
 
-    # ---- Build MODEL CSV (numeric-only): composition fractions FIRST, then numerics, then encoded cats; NO original strings
+    # ---- MODEL CSV ----
     model_cols = (
-        list(comp_frac_df.columns) +                     # composition fractions (sum=1)
-        NUM_COLS +                                       # numeric properties (y is Yield_Strength)
-        [f"{c}_encoded" for c in CAT_COLS]               # encoded categoricals
+        list(comp_frac_df.columns) +
+        NUM_COLS +
+        [f"{c}_encoded" for c in CAT_COLS]
     )
     df_model = pd.concat([comp_frac_df, df_best], axis=1)
     model_cols = [c for c in model_cols if c in df_model.columns]
