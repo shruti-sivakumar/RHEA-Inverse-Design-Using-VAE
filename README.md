@@ -1,1 +1,1 @@
-# RHEA-Inverse-Design-Using-VAE
+# RHEA-Inverse-Design-Using-CVAE
