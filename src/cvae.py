@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 # -----------------------
 # Helper: simple MLP
@@ -102,20 +103,22 @@ class CVAE(nn.Module):
         return mu + eps * std
 
     def forward(self, x, y_cond):
-        # Encoder -> latent posterior
         q_mu, q_logvar = self.enc(x, y_cond)
         z = self.reparameterize(q_mu, q_logvar)
 
-        # Conditional prior p(z|y_cond)
         p_mu, p_logvar = self.prior(y_cond)
-
-        # Decoder reconstructs x
         x_hat = self.dec(z, y_cond)
-
-        # Predict property from z
         y_prop_pred = self.prop_head(z)
 
         return x_hat, y_prop_pred, (q_mu, q_logvar, p_mu, p_logvar)
+
+    def sample_prior(self, y_cond, n=1):
+        """Sample latent z from conditional prior."""
+        p_mu, p_logvar = self.prior(y_cond)
+        std = torch.exp(0.5 * p_logvar)
+        eps = torch.randn((n, p_mu.size(-1)), device=p_mu.device)
+        z = p_mu + eps * std
+        return z
 
 
 # -----------------------

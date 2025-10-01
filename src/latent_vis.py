@@ -1,106 +1,112 @@
-# src/latent_vis.py
-import joblib, torch, numpy as np, pandas as pd
-from pathlib import Path
-from sklearn.manifold import TSNE
+import os
+import numpy as np
+import pandas as pd
+import torch
 import matplotlib.pyplot as plt
-from cvae import CVAE
-from generate import suggest
+from sklearn.manifold import TSNE
+from pathlib import Path
+import joblib
 
-# -------------------
-# Load model + scalers
-# -------------------
-scalers = joblib.load(
-    "/Users/shrutisivakumar/Library/CloudStorage/OneDrive-Personal/College Stuff/"
-    "Sem 5/Projects/DDMM/RHEA-Inverse-Design-Using-VAE/data/processed/scalers.joblib"
-)
-x_scaler = scalers["x_scaler"]
-y_prop_scaler = scalers["y_prop_scaler"]
-y_cond_scaler = scalers["y_cond_scaler"]
+from cvae import CVAE
+
+# --------------------------
+# Config
+# --------------------------
+DATA_FILE = "/Users/shrutisivakumar/Library/CloudStorage/OneDrive-Personal/College Stuff/Sem 5/Projects/DDMM/RHEA-Inverse-Design-Using-VAE/data/encoded_data.csv"
+SCALER_FILE = "/Users/shrutisivakumar/Library/CloudStorage/OneDrive-Personal/College Stuff/Sem 5/Projects/DDMM/RHEA-Inverse-Design-Using-VAE/data/processed/scalers.joblib"
+MODEL_FILE = "/Users/shrutisivakumar/Library/CloudStorage/OneDrive-Personal/College Stuff/Sem 5/Projects/DDMM/RHEA-Inverse-Design-Using-VAE/models/cvae_best.pt"
+OUT_DIR = Path("/Users/shrutisivakumar/Library/CloudStorage/OneDrive-Personal/College Stuff/Sem 5/Projects/DDMM/RHEA-Inverse-Design-Using-VAE/outputs")
+OUT_DIR.mkdir(exist_ok=True, parents=True)
+
+LATENT_DIM = 8   # must match training
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# --------------------------
+# Load dataset + scalers
+# --------------------------
+df = pd.read_csv(DATA_FILE)
+scalers = joblib.load(SCALER_FILE)
 feature_cols = scalers["feature_cols"]
 cond_cols = scalers["cond_cols"]
 
-device = torch.device("cpu")
-model = CVAE(x_dim=len(feature_cols),
-             y_cond_dim=len(cond_cols),
-             y_prop_dim=1,
-             z_dim=4, hidden=128).to(device)
-model.load_state_dict(torch.load(
-    "/Users/shrutisivakumar/Library/CloudStorage/OneDrive-Personal/College Stuff/"
-    "Sem 5/Projects/DDMM/RHEA-Inverse-Design-Using-VAE/models/cvae_best.pt",
-    map_location=device
-))
+X = df[feature_cols].fillna(0).values.astype(np.float32)
+y_cond = df[cond_cols].fillna(25).values.astype(np.float32)
+
+# Filter out rows without target property
+if "Yield_Strength" not in df.columns:
+    raise KeyError("Dataset must contain 'Yield_Strength' column.")
+
+df_prop = df.dropna(subset=["Yield_Strength"]).reset_index(drop=True)
+X_prop = df_prop[feature_cols].fillna(0).values.astype(np.float32)
+y_prop = df_prop[["Yield_Strength"]].values.astype(np.float32)
+y_cond_prop = df_prop[cond_cols].fillna(25).values.astype(np.float32)
+
+# --------------------------
+# Load trained CVAE
+# --------------------------
+model = CVAE(
+    x_dim=X.shape[1],
+    y_cond_dim=y_cond.shape[1],
+    y_prop_dim=1,
+    z_dim=LATENT_DIM,
+    hidden=256
+).to(DEVICE)
+
+model.load_state_dict(torch.load(MODEL_FILE, map_location=DEVICE))
 model.eval()
 
-# -------------------
-# Helper: encode to z
-# -------------------
-def get_latent(X, y_cond):
-    X_t = torch.tensor(X, dtype=torch.float32).to(device)
-    y_t = torch.tensor(y_cond, dtype=torch.float32).to(device)
+# --------------------------
+# Encode data into latent space
+# --------------------------
+def get_latents(X, cond):
+    X_t = torch.tensor(X, dtype=torch.float32, device=DEVICE)
+    cond_t = torch.tensor(cond, dtype=torch.float32, device=DEVICE)
     with torch.no_grad():
-        q_mu, q_logvar = model.enc(X_t, y_t)
+        q_mu, q_logvar = model.enc(X_t, cond_t)
         z = q_mu.cpu().numpy()
     return z
 
-# -------------------
-# Load data
-# -------------------
-data = np.load(
-    "/Users/shrutisivakumar/Library/CloudStorage/OneDrive-Personal/College Stuff/"
-    "Sem 5/Projects/DDMM/RHEA-Inverse-Design-Using-VAE/data/processed/data_splits.npz"
-)
-X_train, y_cond_train = data["X_train"], data["y_cond_train"]
+latents = get_latents(X, y_cond)
 
-# Encode training latents
-z_train = get_latent(X_train, y_cond_train)
+# --------------------------
+# t-SNE
+# --------------------------
+tsne = TSNE(n_components=2, random_state=42, init="pca", learning_rate="auto")
+emb = tsne.fit_transform(latents)
 
-# -------------------
-# Generate alloys for eval
-# -------------------
-df_gen = suggest(model, x_scaler, y_prop_scaler, y_cond_scaler,
-                 feature_cols, y_target_scalar=1200.0,
-                 temp=800, N=200, refine=True)
-
-X_gen = df_gen[feature_cols].values
-y_gen = np.full((len(df_gen), 1), 800.0)  # same temp
-y_gen_scaled = y_cond_scaler.transform(y_gen)
-
-z_gen = get_latent(X_gen, y_gen_scaled)
-
-# -------------------
-# Clean invalid latents
-# -------------------
-def clean_latents(z, label):
-    mask = np.isfinite(z).all(axis=1)
-    dropped = (~mask).sum()
-    if dropped > 0:
-        print(f"[WARN] Dropped {dropped} invalid {label} latents")
-    return z[mask]
-
-z_train = clean_latents(z_train, "train")
-z_gen = clean_latents(z_gen, "generated")
-
-# -------------------
-# Run t-SNE
-# -------------------
-all_latent = np.vstack([z_train, z_gen])
-labels = np.array([0]*len(z_train) + [1]*len(z_gen))  # 0=train, 1=generated
-
-tsne = TSNE(n_components=2, perplexity=30, random_state=42, init="pca")
-emb = tsne.fit_transform(all_latent)
-
-# -------------------
-# Plot
-# -------------------
+# --------------------------
+# Plot 1: General Latent Distribution
+# --------------------------
 plt.figure(figsize=(8,6))
-plt.scatter(emb[labels==0,0], emb[labels==0,1], c="blue", alpha=0.5, label="Training Latents")
-plt.scatter(emb[labels==1,0], emb[labels==1,1], c="red", alpha=0.7, label="Generated Alloys")
+plt.scatter(emb[:,0], emb[:,1], s=10, alpha=0.7)
 plt.title("t-SNE of CVAE Latent Space")
-plt.legend()
 plt.tight_layout()
-
-OUT_DIR = Path("../outputs"); OUT_DIR.mkdir(exist_ok=True, parents=True)
-out_path = OUT_DIR / "latent_tsne.png"
-plt.savefig(out_path, dpi=300)
+plt.savefig(OUT_DIR / "latent_tsne_all.png", dpi=300)
 plt.show()
-print(f"[INFO] Saved t-SNE plot → {out_path}")
+
+# --------------------------
+# Plot 2: Latents colored by Yield Strength
+# --------------------------
+df_prop_latents = get_latents(X_prop, y_cond_prop)
+emb_prop = tsne.fit_transform(df_prop_latents)
+
+plt.figure(figsize=(8,6))
+plt.scatter(emb_prop[:,0], emb_prop[:,1],
+            c=y_prop.flatten(), cmap="viridis", s=12)
+plt.colorbar(label="Yield Strength (MPa)")
+plt.title("t-SNE of Training Latents (Colored by Yield Strength)")
+plt.tight_layout()
+plt.savefig(OUT_DIR / "latent_tsne_yield_strength.png", dpi=300)
+plt.show()
+
+# --------------------------
+# Plot 3: Latents colored by Temperature
+# --------------------------
+plt.figure(figsize=(8,6))
+plt.scatter(emb_prop[:,0], emb_prop[:,1],
+            c=y_cond_prop.flatten(), cmap="coolwarm", s=12)
+plt.colorbar(label="Temperature (°C)")
+plt.title("t-SNE of Training Latents (Colored by Temperature)")
+plt.tight_layout()
+plt.savefig(OUT_DIR / "latent_tsne_temperature.png", dpi=300)
+plt.show()
