@@ -23,7 +23,7 @@ class MLP(nn.Module):
 # Conditional Prior p(z|y_cond)
 # -----------------------
 class ConditionalPrior(nn.Module):
-    def __init__(self, y_dim, z_dim, hidden=64):
+    def __init__(self, y_dim, z_dim, hidden=128):
         super().__init__()
         self.to_mu     = MLP(y_dim, hidden, z_dim)
         self.to_logvar = MLP(y_dim, hidden, z_dim)
@@ -36,7 +36,7 @@ class ConditionalPrior(nn.Module):
 # Encoder q(z|x, y_cond)
 # -----------------------
 class Encoder(nn.Module):
-    def __init__(self, x_dim, y_dim, z_dim, hidden=128):
+    def __init__(self, x_dim, y_dim, z_dim, hidden=256):
         super().__init__()
         self.net_mu     = MLP(x_dim + y_dim, hidden, z_dim, ln=True)
         self.net_logvar = MLP(x_dim + y_dim, hidden, z_dim, ln=True)
@@ -51,7 +51,7 @@ class Encoder(nn.Module):
 # -----------------------
 class DecoderStrongCond(nn.Module):
     """Decoder that concatenates y_cond at every layer (strong conditioning)."""
-    def __init__(self, x_dim, y_dim, z_dim, hidden=128):
+    def __init__(self, x_dim, y_dim, z_dim, hidden=256):
         super().__init__()
         self.fc1 = nn.Linear(z_dim + y_dim, hidden)
         self.fc2 = nn.Linear(hidden + y_dim, hidden)
@@ -69,32 +69,34 @@ class DecoderStrongCond(nn.Module):
 
 
 # -----------------------
-# Property Head: predict y_prop from z
+# Property Head: predict y_prop from z (+ y_cond)
 # -----------------------
 class PropertyHead(nn.Module):
-    """Predict property y_prop from latent z."""
-    def __init__(self, z_dim, y_dim, hidden=64):
+    """Predict property y_prop from latent z (optionally conditioned on y_cond)."""
+    def __init__(self, z_dim, y_cond_dim, y_prop_dim, hidden=128):
         super().__init__()
+        in_dim = z_dim + y_cond_dim  # <-- changed: include y_cond
         self.net = nn.Sequential(
-            nn.Linear(z_dim, hidden), nn.GELU(),
+            nn.Linear(in_dim, hidden), nn.GELU(),
             nn.Linear(hidden, hidden), nn.GELU(),
-            nn.Linear(hidden, y_dim)
+            nn.Linear(hidden, y_prop_dim)
         )
 
-    def forward(self, z):
-        return self.net(z)
+    def forward(self, z, y_cond):
+        zy = torch.cat([z, y_cond], dim=-1)
+        return self.net(zy)
 
 
 # -----------------------
 # CVAE
 # -----------------------
 class CVAE(nn.Module):
-    def __init__(self, x_dim, y_cond_dim, y_prop_dim, z_dim=4, hidden=128):
+    def __init__(self, x_dim, y_cond_dim, y_prop_dim, z_dim=8, hidden=256):
         super().__init__()
         self.enc   = Encoder(x_dim, y_cond_dim, z_dim, hidden)
         self.dec   = DecoderStrongCond(x_dim, y_cond_dim, z_dim, hidden)
-        self.prior = ConditionalPrior(y_cond_dim, z_dim, hidden=64)
-        self.prop_head = PropertyHead(z_dim, y_prop_dim, hidden=64)
+        self.prior = ConditionalPrior(y_cond_dim, z_dim, hidden=128)
+        self.prop_head = PropertyHead(z_dim, y_cond_dim, y_prop_dim, hidden=128)
 
     @staticmethod
     def reparameterize(mu, logvar):
@@ -103,12 +105,18 @@ class CVAE(nn.Module):
         return mu + eps * std
 
     def forward(self, x, y_cond):
+        # Encoder
         q_mu, q_logvar = self.enc(x, y_cond)
         z = self.reparameterize(q_mu, q_logvar)
 
+        # Prior
         p_mu, p_logvar = self.prior(y_cond)
+
+        # Decoder
         x_hat = self.dec(z, y_cond)
-        y_prop_pred = self.prop_head(z)
+
+        # Property prediction (now conditioned on y_cond)
+        y_prop_pred = self.prop_head(z, y_cond)
 
         return x_hat, y_prop_pred, (q_mu, q_logvar, p_mu, p_logvar)
 
