@@ -12,10 +12,10 @@ ELEMENTS = ['Al', 'Co', 'Cr', 'Hf', 'Mo', 'Nb', 'Si', 'Ta', 'Ti', 'V', 'W', 'Zr'
 NUM_COLS = [
     "Density",
     "Young_Modulus_ROM",
-    "Young_Modulus_Exp",
+    "Young_Modulus_Exp",     # will be dropped for model CSV
     "Testing_Temp",
     "Yield_Strength",
-    "Specific_Strength",
+    "Specific_Strength",     # will be dropped for model CSV
 ]
 
 CAT_COLS = [
@@ -24,6 +24,8 @@ CAT_COLS = [
     "Type_Present_Phases",
     "Tension_Compression",
 ]
+
+LEAK_COLS = ["Specific_Strength", "Young_Modulus_Exp"]
 
 EL_RE = re.compile(r"([A-Z][a-z]?)(\d*\.?\d+)?")
 
@@ -67,12 +69,9 @@ def parse_composition_to_percents(comp_str: str, elements=ELEMENTS, eps=1e-12):
             counts[el] *= (100.0 / s)
     return counts
 
-def pick_best_max_yield_then_specific(g: pd.DataFrame) -> pd.Series:
-    max_y = g["Yield_Strength"].max()
-    top = g[g["Yield_Strength"] == max_y]
-    if len(top) == 1:
-        return top.iloc[0]
-    return top.loc[top["Specific_Strength"].fillna(-np.inf).idxmax()]
+def pick_best_max_yield(g: pd.DataFrame) -> pd.Series:
+    """Keep the row with the maximum Yield_Strength for this (Composition, Temp)."""
+    return g.loc[g["Yield_Strength"].idxmax()]
 
 def main():
     df = pd.read_csv(IN_FILE)
@@ -86,7 +85,7 @@ def main():
     # Deduplicate per (Composition, Testing_Temp) (keep highest Yield_Strength)
     df_best = (
         df.groupby(["Composition", "Testing_Temp"], as_index=False, group_keys=False)
-        .apply(pick_best_max_yield_then_specific, include_groups=False)
+        .apply(pick_best_max_yield, include_groups=False)
         .reset_index(drop=True)
     )
 
@@ -103,14 +102,12 @@ def main():
     comp_frac_df.columns = [c.replace("_pct", "_frac") for c in comp_frac_df.columns]
 
     # Encode categoricals (keep both original for human CSV and encoded for model CSV)
-    encoders = {}
     for col in CAT_COLS:
         if col not in df_best.columns:
             df_best[col] = "Unknown"
         df_best[col] = df_best[col].fillna("Unknown").astype(str)
         le = LabelEncoder()
         df_best[f"{col}_encoded"] = le.fit_transform(df_best[col])
-        encoders[col] = le
 
     # Drop Ref if present
     if "Ref" in df_best.columns:
@@ -134,7 +131,7 @@ def main():
     # ---- MODEL CSV ----
     model_cols = (
         list(comp_frac_df.columns) +
-        NUM_COLS +
+        [c for c in NUM_COLS if c not in LEAK_COLS] +
         [f"{c}_encoded" for c in CAT_COLS]
     )
     df_model = pd.concat([comp_frac_df, df_best], axis=1)
