@@ -71,25 +71,50 @@ def predict_strength(X_block):
     return y_prop_scaler.inverse_transform(y_pred.cpu().numpy())
 
 # --------------------------
-# Correlation check (Train vs Generated)
+# Correlation check (Train vs Generated) — CLEAN & CONSISTENT
 # --------------------------
-corr_train = pd.DataFrame(np.c_[X, y_prop], columns=feature_cols + ["Yield_Strength"]).corr()["Yield_Strength"]
+# Compute training correlations
+train_corr = (
+    pd.DataFrame(np.c_[X, y_prop], columns=feature_cols + ["Yield_Strength"])
+    .corrwith(pd.Series(y_prop.ravel(), name="Yield_Strength"))
+    .rename("Train")
+)
 
-# Generate alloys for comparison
-gen_df = suggest(model, x_scaler, y_prop_scaler, y_cond_scaler,
-                 feature_cols, y_target_scalar=1500.0, temp=800, N=200)
+# Generate new alloys for comparison
+gen_df = suggest(
+    model, x_scaler, y_prop_scaler, y_cond_scaler,
+    feature_cols, y_target_scalar=1500.0, temp=800, N=200
+)
 
-corr_gen = gen_df.corr()["Predicted_Yield_Strength"]
+# Compute correlations for generated data only on valid columns
+valid_feats = [c for c in gen_df.columns if c in feature_cols]
+gen_corr = (
+    gen_df[valid_feats + ["Predicted_Yield_Strength"]]
+    .corrwith(gen_df["Predicted_Yield_Strength"])
+    .rename("Generated")
+)
 
-# Heatmap
-corr_df = pd.concat([corr_train, corr_gen], axis=1, keys=["Train", "Generated"])
-plt.figure(figsize=(8,10))
-sns.heatmap(corr_df, annot=False, cmap="coolwarm", center=0, cbar=True)
-plt.title("Feature–Strength Correlation: Train vs Generated")
+# Combine correlations
+corr_df = pd.concat([train_corr, gen_corr], axis=1)
+
+# Keep only features that exist in both
+corr_df = corr_df.dropna(how="all").loc[valid_feats]  # clean up missing ones
+
+# Plot
+plt.figure(figsize=(8, 10))
+sns.heatmap(
+    corr_df, cmap="coolwarm", center=0, annot=False,
+    linewidths=0.5, cbar_kws={'label': 'Correlation (r)'},
+    vmin=-1, vmax=1
+)
+plt.title("Feature–Strength Correlation: Train vs Generated", fontsize=12, pad=12)
+plt.xlabel("")
+plt.ylabel("")
 plt.tight_layout()
 plt.savefig(OUT_DIR / "correlation_train_vs_generated.png", dpi=300)
 plt.close()
-print(f"[OK] Correlation heatmap saved → {OUT_DIR/'correlation_train_vs_generated.png'}")
+print(f"[OK] Cleaned correlation heatmap saved → {OUT_DIR/'correlation_train_vs_generated.png'}")
+
 
 # --------------------------
 # Permutation Feature Importance (PFI)
